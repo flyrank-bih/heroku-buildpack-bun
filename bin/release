@@ -3,6 +3,12 @@
 cat << EOF
 ---
 addons: []
+config_vars:
+  BUN_CACHE_DIR: .bun/cache
+  PATH: /app/.heroku/bin:/app/.bun/bin:$PATH
 default_process_types:
   web: bun start
+  worker: bun run worker
+  cache-clean: bun pm cache clean
+  cache-prune: bun pm cache prune
 EOF

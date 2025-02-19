@@ -9,7 +9,7 @@ set -eo pipefail
 BUILD_DIR=${1:-.}
 CACHE_DIR=${2:-}
 ENV_DIR=${3:-}
-BP_DIR=$(cd "$(dirname "${0:-}")"; cd ..; pwd)
+BP_DIR=$(cd "$(dirname "${0:-}")/.." && pwd)
 
 ### Load dependencies
 source "$BP_DIR/lib/json.sh"
@@ -17,87 +17,103 @@ source "$BP_DIR/lib/json.sh"
 HEROKU_DIR=$BUILD_DIR/.heroku
 BIN_DIR=$HEROKU_DIR/bin
 
-# To enable the local source build cache path, copy the files and match the build path with the startup path.
-cp -rp $BUILD_DIR $HOME
-cd $HOME
-
 # Export the content of the ENV_DIR into the environment
-if [ -d "$ENV_DIR" ]; then
-  for e in $(ls $ENV_DIR); do
-    export "$e=$(cat $ENV_DIR/$e)"
-  done
-fi
+export_env_vars() {
+  if [ -d "$ENV_DIR" ]; then
+    for e in $(ls $ENV_DIR); do
+      export "$e=$(cat $ENV_DIR/$e)"
+    done
+  fi
+}
 
-# Allow Bun version pinning via a choice of 3 different files
-if [ -f $BUILD_DIR/.bun-version ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/.bun-version)"
-elif [ -f $BUILD_DIR/runtime.bun.txt ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/runtime.bun.txt)"
-elif [ -f $BUILD_DIR/runtime.txt ]
-then
-  BUN_VERSION="$(cat $BUILD_DIR/runtime.txt)"
-fi
-echo "Installing Bun $BUN_VERSION"
+# Determine Bun version
+determine_bun_version() {
+  if [ -f $BUILD_DIR/.bun-version ]; then
+    BUN_VERSION="$(cat $BUILD_DIR/.bun-version)"
+  elif [ -f $BUILD_DIR/runtime.bun.txt ]; then
+    BUN_VERSION="$(cat $BUILD_DIR/runtime.bun.txt)"
+  elif [ -f $BUILD_DIR/runtime.txt ]; then
+    BUN_VERSION="$(cat $BUILD_DIR/runtime.txt)"
+  elif [ -n "$BUN_VERSION" ]; then
+    echo "Using BUN_VERSION from environment: $BUN_VERSION"
+  else
+    echo "No Bun version specified, using latest stable version"
+  fi
 
-if [[ -n $BUN_VERSION ]]
-then
-  # prepend a v to version numbers, eg 1.0.19 -> v1.0.19
-  if [[ $BUN_VERSION =~ ^[0-9] ]]; then
+  if [[ -n $BUN_VERSION && $BUN_VERSION =~ ^[0-9] ]]; then
     BUN_VERSION="v${BUN_VERSION}"
   fi
-  BUN_INSTALL_VERSION="-s bun-$BUN_VERSION"
-fi
+}
 
-# install bun
-export BUN_INSTALL=$BUILD_DIR/.heroku
-export BUN_DIR=$BUILD_DIR/.heroku/cache
-curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash $BUN_INSTALL_VERSION
-export PATH="$BUN_INSTALL/bin:$PATH"
+# Install Bun
+install_bun() {
+  log "Installing Bun $BUN_VERSION"
+  export BUN_INSTALL=$BUILD_DIR/.heroku
+  export BUN_DIR=$BUILD_DIR/.heroku/cache
+  curl -fsSL --retry-connrefused --retry 3 https://bun.sh/install | bash ${BUN_VERSION:+-s bun-$BUN_VERSION}
+  export PATH="$BUN_INSTALL/bin:$PATH"
+}
 
-# set environment variables at runtime
-PROFILE_PATH="$BUILD_DIR/.profile.d/bun.sh"
-mkdir -p $(dirname $PROFILE_PATH)
-echo 'export PATH="$HOME/.heroku/bin:$PATH"' >> $PROFILE_PATH
-echo 'export BUN_DIR="$HOME/.heroku/cache"' >> $PROFILE_PATH
+# Set up environment variables
+setup_env_vars() {
+  PROFILE_PATH="$BUILD_DIR/.profile.d/bun.sh"
+  mkdir -p $(dirname $PROFILE_PATH)
+  echo 'export PATH="$HOME/.heroku/bin:$PATH"' >>$PROFILE_PATH
+  echo 'export BUN_DIR="$HOME/.heroku/cache"' >>$PROFILE_PATH
 
-# export environment variables to subsequent buildpacks
-echo "export PATH=\"$BUILD_DIR/.heroku/bin:\$PATH\"" >> "$BP_DIR/export"
-echo "export BUN_DIR=\"$BUILD_DIR/.heroku/cache\"" >> "$BP_DIR/export"
+  echo "export PATH=\"$BUILD_DIR/.heroku/bin:\$PATH\"" >>"$BP_DIR/export"
+  echo "export BUN_DIR=\"$BUILD_DIR/.heroku/cache\"" >>"$BP_DIR/export"
+}
 
-echo "Installed Bun v$(bun --version)"
+# Run npm scripts if they exist
+run_npm_script() {
+  local script_name=$1
+  local skip_file=".skip-bun-$script_name"
+  if [[ $(has_script "package.json" "$script_name") == "true" && ! -f $skip_file ]]; then
+    log "Running $script_name script..."
+    bun run $script_name
+  fi
+}
 
-set +e
+# Main function
+main() {
+  export_env_vars
+  determine_bun_version
+  install_bun
+  setup_env_vars
 
-cd $BUILD_DIR
+  log "Installed Bun v$(bun --version)"
 
-# download dependencies
-if [[ -f package.json && ! -f .skip-bun-install ]]
-then
-  echo "Installing dependencies..."
-  bun install
-fi
+  cd $BUILD_DIR
 
-has_heroku_prebuild_script=$(has_script "package.json" "heroku-prebuild")
-if [[ "$has_heroku_prebuild_script" == "true" && ! -f .skip-bun-heroku-prebuild ]]
-then
-  echo "Running Heroku prebuild script..."
-  bun run heroku-prebuild
-fi
+  if [[ -f package.json && ! -f .skip-bun-install ]]; then
+    log "Installing dependencies..."
+    if [ "$NODE_ENV" = "production" ]; then
+      log "Installing production dependencies only..."
+      bun install --production
+    else
+      bun install
+    fi
+  fi
 
-has_build_script=$(has_script "package.json" "build")
-if [[ "$has_build_script" == "true" && ! -f .skip-bun-build ]]
-then
-  echo "Building application..."
-  bun run build
-  echo "Done building application..."
-fi
+  run_npm_script "heroku-prebuild"
+  run_npm_script "build"
+  run_npm_script "heroku-postbuild"
+}
 
-has_heroku_postbuild_script=$(has_script "package.json" "heroku-postbuild")
-if [[ "$has_heroku_postbuild_script" == "true" && ! -f .skip-bun-heroku-postbuild ]]
-then
-  echo "Running Heroku postbuild script..."
-  bun run heroku-postbuild
-fi
+# Logging function
+log() {
+  echo "-----> $*"
+}
 
+# Error handling
+handle_error() {
+  log "Error: $1"
+  exit 1
+}
+
+# Trap errors
+trap 'handle_error "An error occurred. Check the build logs for details."' ERR
+
+# Execute main function
+main
