@@ -86,15 +86,15 @@ main() {
 
   cd $BUILD_DIR
 
-  if [[ -f package.json && ! -f .skip-bun-install ]]; then
-    log "Installing dependencies..."
-    if [ "$NODE_ENV" = "production" ]; then
-      log "Installing production dependencies only..."
-      bun install --production
-    else
-      bun install
-    fi
+if [[ -f package.json && ! -f .skip-bun-install ]]; then
+  log "Installing dependencies..."
+  if [ "$NODE_ENV" = "production" ]; then
+    log "Installing production dependencies only..."
+    bun install --production --no-frozen-lockfile
+  else
+    bun install --no-frozen-lockfile
   fi
+fi
 
   run_npm_script "heroku-prebuild"
   run_npm_script "build"
